@@ -153,9 +153,6 @@ jobs:
                   text=text,
               )
 
-          def git_bytes(*args):
-              return subprocess.check_output(["git", *args])
-
           def stage(path):
               git("add", "--", path)
 
@@ -163,6 +160,10 @@ jobs:
               git("checkout", "--theirs", "--", path)
               stage(path)
               print(f"Resolved using official OpenWrt upstream: {path}")
+
+          def accept_upstream_deletion(path):
+              git("rm", "-f", "--", path)
+              print(f"Accepted official OpenWrt deletion: {path}")
 
           def ours_text(path):
               return git("show", f":2:{path}")
@@ -175,22 +176,31 @@ jobs:
               stage(path)
               print(f"Resolved by preserving JIDU6J11 changes: {path}")
 
+          # Files where official OpenWrt upstream should completely win.
           upstream_files = [
               "package/firmware/ath11k-firmware/Makefile",
               "package/kernel/mac80211/Makefile",
               "target/linux/generic/pending-6.18/706-net-phy-populate-host_interfaces-when-attaching-PHY.patch",
               "target/linux/generic/pending-6.18/737-01-net-phylink-keep-and-use-MAC-supported_interfaces-in.patch",
               "target/linux/generic/pending-6.18/737-02-net-phylink-introduce-internal-phylink-PCS-handling.patch",
+              "target/linux/generic/pending-6.18/737-07-net-phylink-add-.pcs_link_down-PCS-OP.patch",
+          ]
+
+          # Files deleted by official OpenWrt upstream but modified in the fork.
+          # Accept upstream's deletion.
+          upstream_deleted_files = [
               "target/linux/generic/pending-6.18/737-03-net-phylink-add-phylink_release_pcs-to-externally-re.patch",
               "target/linux/generic/pending-6.18/737-05-net-phylink-support-late-PCS-provider-attach.patch",
-              "target/linux/generic/pending-6.18/737-07-net-phylink-add-.pcs_link_down-PCS-OP.patch",
           ]
 
           for path in upstream_files:
               take_upstream(path)
 
-          # Resolve U-Boot environment file:
-          # retain upstream boards and reinsert all JIDU6J11 cases.
+          for path in upstream_deleted_files:
+              accept_upstream_deletion(path)
+
+          # Resolve U-Boot environment configuration:
+          # retain official upstream boards and restore JIDU6J11 cases.
           uboot_env = os.environ["UBOOT_ENV_FILE"]
           theirs = theirs_text(uboot_env)
           ours = ours_text(uboot_env)
@@ -325,6 +335,16 @@ jobs:
           grep -q "jiorouter,ax6000-jidu6j11-$JIDU_VARIANT" \
             "$PLATFORM_SH_FILE"
 
+      - name: Verify replaced phylink patches are present
+        run: |
+          set -euo pipefail
+
+          if ! grep -RqsE 'phylink_release_pcs|late-PCS-provider|pcs_link_down' \
+            target/linux/generic; then
+            echo "::warning::No replacement phylink patch content was found after accepting upstream deletions."
+            echo "::warning::Review target/linux/generic/pending-6.18/ before merging this sync branch."
+          fi
+
       - name: Commit automatic merge resolution
         run: |
           set -euo pipefail
@@ -334,6 +354,7 @@ jobs:
 
           Automatically resolved known conflicts:
           - Took official OpenWrt for generic kernel, mac80211 and ath11k firmware files
+          - Accepted official OpenWrt deletions of obsolete phylink patches
           - Preserved JIDU6J11 U-Boot environment configuration
           - Preserved JIDU6J11 initial U-Boot setup and platform image checks"
           fi
@@ -361,6 +382,7 @@ jobs:
           ### Automatic conflict policy
 
           - Official OpenWrt was preferred for generic kernel patches, \`mac80211\`, and \`ath11k-firmware\`.
+          - Official OpenWrt deletions of obsolete phylink patches were accepted.
           - JIDU6J11 U-Boot environment entries were preserved.
           - JIDU6J11 initial U-Boot setup and platform image checks were preserved.
           - Official OpenWrt platform-upgrade improvements were retained.
