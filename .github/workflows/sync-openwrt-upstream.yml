@@ -1,4 +1,4 @@
-name: Sync JIDU6J11 OpenWrt fork with official OpenWrt
+name: Automatically sync JIDU6J11 OpenWrt fork with official OpenWrt
 
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ on:
           - "6911"
 
       create_pull_request:
-        description: "Create a pull request if the merge is clean"
+        description: "Create a pull request after a successful automatic merge"
         required: true
         default: true
         type: boolean
@@ -46,7 +46,7 @@ concurrency:
 
 jobs:
   sync-upstream:
-    name: Merge official OpenWrt into JIDU6J11 fork
+    name: Merge official OpenWrt and preserve JIDU6J11 support
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -56,6 +56,9 @@ jobs:
       UPSTREAM_REF: ${{ inputs.upstream_ref }}
       JIDU_VARIANT: ${{ inputs.jidu_variant }}
       DEVICE_ID: jiorouter_ax6000-jidu6j11-${{ inputs.jidu_variant }}
+
+      UBOOT_ENV_FILE: package/boot/uboot-tools/uboot-envtools/files/qualcommbe_ipq95xx
+      PLATFORM_SH_FILE: target/linux/qualcommbe/ipq95xx/base-files/lib/upgrade/platform.sh
 
     steps:
       - name: Validate inputs
@@ -79,7 +82,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Configure Git identity
+      - name: Configure Git
         run: |
           set -euo pipefail
 
@@ -87,7 +90,7 @@ jobs:
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Add official OpenWrt upstream remote
+      - name: Add official OpenWrt upstream
         run: |
           set -euo pipefail
 
@@ -106,14 +109,14 @@ jobs:
 
           git checkout -b "$sync_branch"
 
-      - name: Attempt merge from official OpenWrt
+      - name: Attempt upstream merge
         id: merge
         run: |
           set -uo pipefail
 
           merge_ok=true
 
-          if ! git merge --no-edit \
+          if ! git merge --no-commit --no-ff \
             "upstream/$UPSTREAM_REF"; then
             merge_ok=false
           fi
@@ -125,65 +128,224 @@ jobs:
           if [ "$merge_ok" = "false" ]; then
             echo "MERGE_CONFLICT=true" >> "$GITHUB_ENV"
 
-            echo "::error::Upstream merge has conflicts requiring manual resolution."
-            echo "::group::Conflicted files"
-            git diff --name-only --diff-filter=U || true
-            echo "::endgroup::"
+            echo "::notice::Upstream merge produced conflicts. Applying known JIDU6J11-safe resolutions."
+          else
+            echo "MERGE_CONFLICT=false" >> "$GITHUB_ENV"
+          fi
 
-            echo "::group::Merge status"
-            git status || true
-            echo "::endgroup::"
+      - name: Automatically resolve known conflicts
+        if: env.MERGE_CONFLICT == 'true'
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
 
-            mkdir -p conflict-report
+          python3 <<'PYEOF'
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
 
-            git diff --name-only --diff-filter=U \
-              > conflict-report/conflicted-files.txt || true
+          def git(*args, text=True):
+              return subprocess.check_output(
+                  ["git", *args],
+                  text=text,
+              )
 
-            git status > conflict-report/git-status.txt || true
+          def git_bytes(*args):
+              return subprocess.check_output(["git", *args])
 
-            git diff > conflict-report/conflict-diff.patch || true
+          def stage(path):
+              git("add", "--", path)
 
+          def take_upstream(path):
+              git("checkout", "--theirs", "--", path)
+              stage(path)
+              print(f"Resolved using official OpenWrt upstream: {path}")
+
+          def ours_text(path):
+              return git("show", f":2:{path}")
+
+          def theirs_text(path):
+              return git("show", f":3:{path}")
+
+          def write_and_stage(path, content):
+              Path(path).write_text(content, encoding="utf-8")
+              stage(path)
+              print(f"Resolved by preserving JIDU6J11 changes: {path}")
+
+          upstream_files = [
+              "package/firmware/ath11k-firmware/Makefile",
+              "package/kernel/mac80211/Makefile",
+              "target/linux/generic/pending-6.18/706-net-phy-populate-host_interfaces-when-attaching-PHY.patch",
+              "target/linux/generic/pending-6.18/737-01-net-phylink-keep-and-use-MAC-supported_interfaces-in.patch",
+              "target/linux/generic/pending-6.18/737-02-net-phylink-introduce-internal-phylink-PCS-handling.patch",
+              "target/linux/generic/pending-6.18/737-03-net-phylink-add-phylink_release_pcs-to-externally-re.patch",
+              "target/linux/generic/pending-6.18/737-05-net-phylink-support-late-PCS-provider-attach.patch",
+              "target/linux/generic/pending-6.18/737-07-net-phylink-add-.pcs_link_down-PCS-OP.patch",
+          ]
+
+          for path in upstream_files:
+              take_upstream(path)
+
+          # Resolve U-Boot environment file:
+          # retain upstream boards and reinsert all JIDU6J11 cases.
+          uboot_env = os.environ["UBOOT_ENV_FILE"]
+          theirs = theirs_text(uboot_env)
+          ours = ours_text(uboot_env)
+
+          jidu_block_match = re.search(
+              r"(jiorouter,ax6000-jidu6j11-6111\|\\\n.*?ubootenv_add_mtd[^\n]*\n)",
+              ours,
+              flags=re.DOTALL,
+          )
+
+          if not jidu_block_match:
+              print("::error::Could not find the JIDU6J11 U-Boot environment block in the fork version.")
+              sys.exit(1)
+
+          jidu_block = jidu_block_match.group(1)
+
+          if "jiorouter,ax6000-jidu6j11-6111" not in theirs:
+              insertion = f"{jidu_block}\t;;\n"
+              theirs = theirs.replace(
+                  "\tesac\n",
+                  insertion + "\tesac\n",
+                  1,
+              )
+
+          write_and_stage(uboot_env, theirs)
+
+          # Resolve platform.sh:
+          # use official upstream as the base, then restore the JIDU6J11
+          # initial U-Boot setup and platform image check.
+          platform_sh = os.environ["PLATFORM_SH_FILE"]
+          theirs = theirs_text(platform_sh)
+          ours = ours_text(platform_sh)
+
+          initial_setup_match = re.search(
+              r"(jiorouter_initial_setup\\(\\).*?\n\}\n)",
+              ours,
+              flags=re.DOTALL,
+          )
+
+          if not initial_setup_match:
+              print("::error::Could not find jiorouter_initial_setup() in the fork version.")
+              sys.exit(1)
+
+          jidu_initial_setup = initial_setup_match.group(1)
+
+          # Remove any existing JIDU initial-setup function from upstream base.
+          theirs = re.sub(
+              r"jiorouter_initial_setup\\(\\).*?\n\}\n\n?",
+              "",
+              theirs,
+              flags=re.DOTALL,
+          )
+
+          # Insert the JIDU setup function immediately before platform_check_image().
+          if "jiorouter_initial_setup()" not in theirs:
+              theirs = re.sub(
+                  r"(?m)^platform_check_image\\(\\)",
+                  jidu_initial_setup + "\nplatform_check_image()",
+                  theirs,
+                  count=1,
+              )
+
+          # Extract the JIDU case from the fork's platform_check_image().
+          jidu_case_match = re.search(
+              r"(\tjiorouter,ax6000-jidu6j11-6111\|\\\n.*?\t\t;;\n)",
+              ours,
+              flags=re.DOTALL,
+          )
+
+          if not jidu_case_match:
+              print("::error::Could not find the JIDU6J11 platform_check_image case in the fork version.")
+              sys.exit(1)
+
+          jidu_case = jidu_case_match.group(1)
+
+          # Insert the JIDU case as the first case in upstream's check function.
+          theirs = re.sub(
+              r"(?m)^(\tcase \"\$\\(board\_name\\)\" in\n)",
+              r"\1" + jidu_case,
+              theirs,
+              count=1,
+          )
+
+          write_and_stage(platform_sh, theirs)
+
+          # Ensure no unexpected conflicts remain.
+          unmerged = git("diff", "--name-only", "--diff-filter=U").strip()
+
+          if unmerged:
+              print("::error::The following conflicts require manual resolution:")
+              print(unmerged)
+              sys.exit(1)
+          PYEOF
+
+      - name: Verify no conflict markers or unmerged files
+        run: |
+          set -euo pipefail
+
+          if [ -n "$(git ls-files -u)" ]; then
+            echo "::error::Unmerged files remain:"
+            git ls-files -u
             exit 1
           fi
 
-          echo "MERGE_CONFLICT=false" >> "$GITHUB_ENV"
+          if grep -RInE '^(<<<<<<<|=======|>>>>>>>)' \
+            package \
+            target \
+            include; then
+            echo "::error::Conflict markers remain in the source tree."
+            exit 1
+          fi
 
-      - name: Verify JIDU6J11 device support survived merge
-        if: env.MERGE_CONFLICT == 'false'
+      - name: Verify JIDU6J11 device support survived
         run: |
           set -euo pipefail
 
           if ! grep -Rqs "$DEVICE_ID" target/linux/qualcommbe; then
-            echo "::error::JIDU6J11 device $DEVICE_ID is missing after upstream merge."
-            echo "::group::Available JIDU6J11 devices"
-            grep -RhoE 'jiorouter_ax6000-jidu6j11-[0-9]+' \
-              target/linux/qualcommbe | sort -u || true
-            echo "::endgroup::"
+            echo "::error::JIDU6J11 device $DEVICE_ID is missing after merge."
             exit 1
           fi
 
           grep -Rni "$DEVICE_ID" target/linux/qualcommbe
 
-      - name: Upload conflict report
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: upstream-merge-conflicts-${{ github.run_number }}
-          path: conflict-report/
-          if-no-files-found: ignore
-          retention-days: 14
+      - name: Verify JIDU U-Boot and upgrade support survived
+        run: |
+          set -euo pipefail
 
-      - name: Push clean merge branch
-        if: env.MERGE_CONFLICT == 'false'
+          grep -q "jiorouter,ax6000-jidu6j11-$JIDU_VARIANT" \
+            "$UBOOT_ENV_FILE"
+
+          grep -q "jiorouter_initial_setup" "$PLATFORM_SH_FILE"
+          grep -q "jiorouter,ax6000-jidu6j11-$JIDU_VARIANT" \
+            "$PLATFORM_SH_FILE"
+
+      - name: Commit automatic merge resolution
+        run: |
+          set -euo pipefail
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "Merge official OpenWrt $UPSTREAM_REF into JIDU6J11 fork
+
+          Automatically resolved known conflicts:
+          - Took official OpenWrt for generic kernel, mac80211 and ath11k firmware files
+          - Preserved JIDU6J11 U-Boot environment configuration
+          - Preserved JIDU6J11 initial U-Boot setup and platform image checks"
+          fi
+
+      - name: Push upstream-sync branch
         run: |
           set -euo pipefail
 
           git push origin "$SYNC_BRANCH"
 
       - name: Create pull request
-        if: >
-          env.MERGE_CONFLICT == 'false' &&
-          inputs.create_pull_request == true
+        if: inputs.create_pull_request == true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -196,19 +358,18 @@ jobs:
 
           **Target device:** \`$DEVICE_ID\`
 
-          ### Before merging this pull request
+          ### Automatic conflict policy
 
-          - Review conflicts and JIDU/QCA-specific changes.
+          - Official OpenWrt was preferred for generic kernel patches, \`mac80211\`, and \`ath11k-firmware\`.
+          - JIDU6J11 U-Boot environment entries were preserved.
+          - JIDU6J11 initial U-Boot setup and platform image checks were preserved.
+          - Official OpenWrt platform-upgrade improvements were retained.
+
+          ### Required review before merging
+
+          - Review \`target/linux/qualcommbe/\` and QCA-related changes.
           - Run the JIDU6J11 firmware build workflow against this branch.
           - Test the resulting \`*-initramfs-factory.ubi\` before flashing a permanent sysupgrade image.
-
-          ### Files to review especially
-
-          - \`target/linux/generic/\`
-          - \`target/linux/qualcommbe/\`
-          - \`include/kernel-*\`
-          - \`package/kernel/\`
-          - QCA wireless/NSS-related patches
           EOF
           )
 
@@ -218,41 +379,23 @@ jobs:
             --title "$title" \
             --body "$body"
 
-      - name: Explain conflict resolution
+      - name: Upload unresolved conflict report
         if: failure()
         run: |
-          cat <<'EOF'
-          The upstream merge could not be completed automatically.
+          set -euo pipefail
 
-          Download the `upstream-merge-conflicts` artifact. It contains:
+          mkdir -p conflict-report
 
-          - conflicted-files.txt
-          - git-status.txt
-          - conflict-diff.patch
+          git status > conflict-report/git-status.txt || true
+          git diff --name-only --diff-filter=U \
+            > conflict-report/conflicted-files.txt || true
+          git diff > conflict-report/conflict-diff.patch || true
 
-          Resolve conflicts locally, preserving JIDU6J11 device support:
-
-            git fetch origin
-            git checkout <your-fork-branch>
-            git pull
-            git remote add upstream https://github.com/openwrt/openwrt.git
-            git fetch upstream
-            git checkout -b jidu6j11-upstream-sync
-            git merge upstream/main
-
-          Prefer official upstream for:
-            - target/linux/generic/
-            - include/kernel-*
-            - package/kernel/
-            - core packages
-
-          Preserve JIDU6J11 support in:
-            - target/linux/qualcommbe/ipq95xx/
-            - target/linux/qualcommbe/image/ipq95xx.mk
-            - JIDU DTS, board-support, calibration, and image-generation files
-
-          After resolving:
-            git add .
-            git commit
-            git push origin jidu6j11-upstream-sync
-          EOF
+      - name: Upload conflict artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-merge-conflicts-${{ github.run_number }}
+          path: conflict-report/
+          if-no-files-found: ignore
+          retention-days: 14
