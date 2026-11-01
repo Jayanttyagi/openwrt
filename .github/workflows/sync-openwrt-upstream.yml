@@ -142,7 +142,6 @@ jobs:
 
           python3 <<'PYEOF'
           import os
-          import re
           import subprocess
           import sys
           from pathlib import Path
@@ -179,63 +178,80 @@ jobs:
           def normalize(text):
               return text.replace("\r\n", "\n").replace("\r", "\n")
 
-          def extract_shell_function(source, function_name):
-              """
-              Extract a POSIX shell function by tracking brace depth.
-              More reliable than assuming the closing brace is exactly '}'
-              at the beginning of a line.
-              """
-              source = normalize(source)
-              lines = source.splitlines()
+          def find_function_lines(lines, function_name):
               start = None
               depth = 0
-              found_open_brace = False
-
-              function_pattern = re.compile(
-                  rf"^\s*{re.escape(function_name)}\s*\\(\\)\s*\{{\s*$"
-              )
 
               for index, line in enumerate(lines):
+                  stripped = line.strip()
+
                   if start is None:
-                      if function_pattern.match(line):
+                      if stripped.startswith(f"{function_name}(") and stripped.endswith("{"):
                           start = index
                           depth = line.count("{") - line.count("}")
-                          found_open_brace = depth > 0
-                  else:
+                          continue
+
+                  if start is not None:
                       depth += line.count("{") - line.count("}")
 
-                      if found_open_brace and depth <= 0:
-                          return "\n".join(lines[start:index + 1]) + "\n"
+                      if depth <= 0:
+                          return start, index
 
               raise ValueError(
-                  f"Could not extract shell function: {function_name}"
+                  f"Could not find shell function: {function_name}"
               )
 
-          def extract_case_block(source, start_pattern):
-              """
-              Extract a shell case block beginning with start_pattern and
-              ending at its matching ';;' line.
-              """
-              source = normalize(source)
-              lines = source.splitlines()
-
-              start_pattern = re.compile(start_pattern)
-              end_pattern = re.compile(r"^\s*;;\s*$")
+          def find_case_lines(lines, marker):
+              start = None
+              depth = 0
 
               for index, line in enumerate(lines):
-                  if start_pattern.search(line):
-                      block = [line]
-                      brace_depth = line.count("{") - line.count("}")
+                  stripped = line.strip()
 
-                      for following in lines[index + 1:]:
-                          block.append(following)
-                          brace_depth += following.count("{") - following.count("}")
+                  if start is None:
+                      if marker in line:
+                          start = index
+                          depth = line.count("{") - line.count("}")
+                          continue
 
-                          if brace_depth <= 0 and end_pattern.match(following):
-                              return "\n".join(block) + "\n"
+                  if start is not None:
+                      depth += line.count("{") - line.count("}")
+
+                      if depth <= 0 and stripped == ";;":
+                          return start, index
 
               raise ValueError(
-                  f"Could not extract case block: {start_pattern.pattern}"
+                  f"Could not find case block containing: {marker}"
+              )
+
+          def join_lines(lines, start, end):
+              return "\n".join(lines[start:end + 1]) + "\n"
+
+          def insert_before_function(lines, function_name, insertion_lines):
+              for index, line in enumerate(lines):
+                  if line.strip().startswith(f"{function_name}("):
+                      lines[index:index] = insertion_lines
+                      return
+
+              raise ValueError(
+                  f"Could not find function: {function_name}"
+              )
+
+          def insert_into_first_case(lines, function_name, insertion_lines):
+              for index, line in enumerate(lines):
+                  if line.strip().startswith(f"{function_name}("):
+                      for case_index in range(index, len(lines)):
+                          if lines[case_index].strip().startswith('case "$(board_name)" in'):
+                              insertion_index = case_index + 1
+                              lines[insertion_index:insertion_index] = insertion_lines
+                              return
+
+                      raise ValueError(
+                          f"Could not find case statement in {function_name}()"
+                      )
+
+              raise ValueError(
+                  f"Could not find function: {function_name}"
               )
 
           upstream_files = [
@@ -258,97 +274,122 @@ jobs:
           for path in upstream_deleted_files:
               accept_upstream_deletion(path)
 
+          marker = "jiorouter,ax6000-jidu6j11-6111"
+
           # Resolve U-Boot environment configuration:
           # retain official upstream boards and restore JIDU6J11 cases.
           uboot_env = os.environ["UBOOT_ENV_FILE"]
-          theirs = normalize(theirs_text(uboot_env))
-          ours = normalize(ours_text(uboot_env))
+          theirs = normalize(theirs_text(uboot_env)).splitlines()
+          ours = normalize(ours_text(uboot_env)).splitlines()
 
           try:
-              jidu_block = extract_case_block(
-                  ours,
-                  r"jiorouter,ax6000-jidu6j11-6111",
-              )
+              jidu_start, jidu_end = find_case_lines(ours, marker)
           except ValueError as exc:
               print("::error::" + str(exc))
               print("::group::Fork U-Boot environment file")
-              print(ours)
+              print("\n".join(ours))
               print("::endgroup::")
               sys.exit(1)
 
-          if "jiorouter,ax6000-jidu6j11-6111" not in theirs:
-              theirs = re.sub(
-                  r"(?m)^esac\s*$",
-                  jidu_block + "\nesac",
-                  theirs,
-                  count=1,
-              )
+          jidu_block = join_lines(ours, jidu_start, jidu_end)
 
-          write_and_stage(uboot_env, theirs)
+          if marker not in "\n".join(theirs):
+              inserted = False
+
+              for index in range(len(theirs) - 1, -1, -1):
+                  if theirs[index].strip() == "esac":
+                      theirs[index:index] = (
+                          jidu_block.rstrip("\n").splitlines()
+                          + ["", "esac"]
+                      )
+                      inserted = True
+                      break
+
+              if not inserted:
+                  raise ValueError(
+                      "Could not find final esac in U-Boot environment file"
+                  )
+
+          write_and_stage(uboot_env, "\n".join(theirs) + "\n")
 
           # Resolve platform.sh:
           # use official upstream as the base, then restore the JIDU6J11
-          # initial U-Boot setup and platform image check.
+          # initial U-Boot setup, upgrade case, and platform image check.
           platform_sh = os.environ["PLATFORM_SH_FILE"]
-          theirs = normalize(theirs_text(platform_sh))
-          ours = normalize(ours_text(platform_sh))
+          theirs = normalize(theirs_text(platform_sh)).splitlines()
+          ours = normalize(ours_text(platform_sh)).splitlines()
 
           try:
-              jidu_initial_setup = extract_shell_function(
+              setup_start, setup_end = find_function_lines(
                   ours,
                   "jiorouter_initial_setup",
               )
           except ValueError as exc:
               print("::error::" + str(exc))
               print("::group::Fork platform.sh content")
-              print(ours)
+              print("\n".join(ours))
               print("::endgroup::")
               sys.exit(1)
 
-          # Remove any existing JIDU initial-setup function from upstream base.
-          theirs = re.sub(
-              r"(?ms)^\s*jiorouter_initial_setup\s*\\(\\)\s*\{.*?^\s*\}\s*$\n?",
-              "",
-              theirs,
-          )
-
-          # Insert the JIDU setup function immediately before platform_check_image().
-          if "jiorouter_initial_setup()" not in theirs:
-              theirs = re.sub(
-                  r"(?m)^platform_check_image\\(\\)",
-                  jidu_initial_setup + "\nplatform_check_image()",
-                  theirs,
-                  count=1,
-              )
+          jidu_initial_setup = join_lines(ours, setup_start, setup_end)
 
           try:
-              jidu_case = extract_case_block(
-                  ours,
-                  r"jiorouter,ax6000-jidu6j11-6111",
-              )
+              upgrade_start, upgrade_end = find_case_lines(ours, marker)
           except ValueError as exc:
               print("::error::" + str(exc))
               print("::group::Fork platform.sh content")
-              print(ours)
+              print("\n".join(ours))
               print("::endgroup::")
               sys.exit(1)
 
-          # Remove any existing JIDU case from upstream's check function.
-          theirs = re.sub(
-              r"(?ms)^\s*jiorouter,ax6000-jidu6j11-6111\|\\.*?^\s*;;\s*$\n?",
-              "",
-              theirs,
-          )
+          jidu_upgrade_case = join_lines(ours, upgrade_start, upgrade_end)
 
-          # Insert the JIDU case as the first case in upstream's check function.
-          theirs = re.sub(
-              r"(?m)^(\tcase \"\$\\(board\_name\\)\" in\n)",
-              r"\1" + jidu_case,
-              theirs,
-              count=1,
-          )
+          try:
+              check_start, check_end = find_case_lines(ours, marker)
+          except ValueError as exc:
+              print("::error::" + str(exc))
+              print("::group::Fork platform.sh content")
+              print("\n".join(ours))
+              print("::endgroup::")
+              sys.exit(1)
 
-          write_and_stage(platform_sh, theirs)
+          jidu_check_case = join_lines(ours, check_start, check_end)
+
+          # Remove any existing JIDU initial-setup function from upstream base.
+          try:
+              existing_start, existing_end = find_function_lines(
+                  theirs,
+                  "jiorouter_initial_setup",
+              )
+              del theirs[existing_start:existing_end + 1]
+          except ValueError:
+              pass
+
+          # Insert the JIDU initial-setup function before platform_check_image().
+          if "jiorouter_initial_setup(" not in "\n".join(theirs):
+              insert_before_function(
+                  theirs,
+                  "platform_check_image",
+                  jidu_initial_setup.rstrip("\n").splitlines() + ["", ""],
+              )
+
+          # Insert the JIDU upgrade case into platform_do_upgrade().
+          if marker not in "\n".join(theirs):
+              insert_into_first_case(
+                  theirs,
+                  "platform_do_upgrade",
+                  jidu_upgrade_case.rstrip("\n").splitlines(),
+              )
+
+          # Insert the JIDU check case into platform_check_image().
+          if marker not in "\n".join(theirs):
+              insert_into_first_case(
+                  theirs,
+                  "platform_check_image",
+                  jidu_check_case.rstrip("\n").splitlines(),
+              )
+
+          write_and_stage(platform_sh, "\n".join(theirs) + "\n")
 
           # Ensure no unexpected conflicts remain.
           unmerged = git("diff", "--name-only", "--diff-filter=U").strip()
@@ -398,6 +439,8 @@ jobs:
           grep -q "jiorouter_initial_setup" "$PLATFORM_SH_FILE"
           grep -q "jiorouter,ax6000-jidu6j11-$JIDU_VARIANT" \
             "$PLATFORM_SH_FILE"
+          grep -q "jiorouter_initial_setup || return 1" \
+            "$PLATFORM_SH_FILE"
 
       - name: Verify replaced phylink patches are present
         run: |
@@ -420,7 +463,7 @@ jobs:
           - Took official OpenWrt for generic kernel, mac80211 and ath11k firmware files
           - Accepted official OpenWrt deletions of obsolete phylink patches
           - Preserved JIDU6J11 U-Boot environment configuration
-          - Preserved JIDU6J11 initial U-Boot setup and platform image checks"
+          - Preserved JIDU6J11 initial U-Boot setup, upgrade handling and platform image checks"
           fi
 
       - name: Push upstream-sync branch
@@ -448,7 +491,7 @@ jobs:
           - Official OpenWrt was preferred for generic kernel patches, \`mac80211\`, and \`ath11k-firmware\`.
           - Official OpenWrt deletions of obsolete phylink patches were accepted.
           - JIDU6J11 U-Boot environment entries were preserved.
-          - JIDU6J11 initial U-Boot setup and platform image checks were preserved.
+          - JIDU6J11 initial U-Boot setup, NAND/UBI upgrade handling, and platform image checks were preserved.
           - Official OpenWrt platform-upgrade improvements were retained.
 
           ### Required review before merging
