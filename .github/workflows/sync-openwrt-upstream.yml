@@ -410,7 +410,14 @@ jobs:
             exit 1
           fi
 
-          if grep -RInE '^(<<<<<<<|=======|>>>>>>>)' \
+          # Match only real Git conflict markers:
+          #   <<<<<<< HEAD
+          #   =======
+          #   >>>>>>> upstream/main
+          #
+          # Do not match OpenWrt's failsafe banner, which contains long
+          # "=====" separator lines.
+          if grep -RInE '^(<{7} .*|={7}[[:space:]]*$|>{7} )' \
             package \
             target \
             include; then
