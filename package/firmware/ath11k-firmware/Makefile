@@ -26,43 +26,21 @@ RSTRIP:=:
 STRIP:=:
 
 ATH11K_LEGACY_FW_NAME:=ath11k-legacy-firmware
-ATH11K_LEGACY_FW_DATE:=2024-06-19
-ATH11K_LEGACY_FW_RELEASE:=d1491a6b
+ATH11K_LEGACY_FW_DATE:=2024-03-14
+ATH11K_LEGACY_FW_RELEASE:=795809c7
 ATH11K_LEGACY_FW_SUBDIR:=$(ATH11K_LEGACY_FW_NAME)-$(ATH11K_LEGACY_FW_DATE)~$(ATH11K_LEGACY_FW_RELEASE)
 ATH11K_LEGACY_FW_SOURCE=$(ATH11K_LEGACY_FW_SUBDIR).tar.zst
+ATH11K_IPQ9574_SUBDIR:=ath11k-firmware/IPQ9574/hw1.0/2.9.0.1/WLAN.HK.2.9.0.1-01890-QCAHKSWPL_SILICONZ-1
 
 define Download/$(ATH11K_LEGACY_FW_NAME)
 	FILE:=$(ATH11K_LEGACY_FW_SOURCE)
 	PROTO:=git
 	URL:=https://github.com/quic/upstream-wifi-fw.git
-	SOURCE_VERSION:=d1491a6b3b22bd6d755bb71ca06aec4246127726
-	MIRROR_HASH:=8882fbb4bf492086c4c9391eb5011e1cccc1acc7c047fd7f83f4c0389e36650d
+	SOURCE_VERSION:=795809c7041582bd51bdfaa1f548b916ae8d4382
+	MIRROR_HASH:=b55bf7204543c7ba87876e84788239b0e47ad62434c5b0d1169526cde36a9daa
 	SUBDIR:=$(ATH11K_LEGACY_FW_SUBDIR)
 endef
 $(eval $(call Download,$(ATH11K_LEGACY_FW_NAME)))
-
-# IPQ9574 is not yet present in the linux-firmware distribution. Its runtime
-# firmware blobs (m3_fw/q6_fw) ship only in the quic upstream-wifi-fw legacy
-# release, while board-2.bin was added to the codelinaro ath11k-firmware repo
-# only in a revision newer than the shared PKG_SOURCE_VERSION used by the
-# other packages. Fetch board-2.bin from the source that carries it instead
-# of bumping the shared PKG_SOURCE_VERSION, which would also change the
-# IPQ6018 firmware shipped by the other packages.
-ATH11K_IPQ9574_FW_NAME:=ath11k-firmware-ipq9574-board
-ATH11K_IPQ9574_FW_DATE:=2026-03-24
-ATH11K_IPQ9574_FW_RELEASE:=2044a5b7
-ATH11K_IPQ9574_FW_SUBDIR:=$(ATH11K_IPQ9574_FW_NAME)-$(ATH11K_IPQ9574_FW_DATE)~$(ATH11K_IPQ9574_FW_RELEASE)
-ATH11K_IPQ9574_FW_SOURCE=$(ATH11K_IPQ9574_FW_SUBDIR).tar.zst
-
-define Download/$(ATH11K_IPQ9574_FW_NAME)
-	FILE:=$(ATH11K_IPQ9574_FW_SOURCE)
-	PROTO:=git
-	URL:=$(PKG_SOURCE_URL)
-	SOURCE_VERSION:=2044a5b7e0da88a34c728a62e7f262b67c141739
-	MIRROR_HASH:=24b32f8ed38b640f40bac2860dd742dd5e5f3dc8bf7e655a7a41bdcbd94b1423
-	SUBDIR:=$(ATH11K_IPQ9574_FW_SUBDIR)
-endef
-$(eval $(call Download,$(ATH11K_IPQ9574_FW_NAME)))
 
 define Package/ath11k-firmware-default
   SECTION:=firmware
@@ -84,21 +62,22 @@ endef
 define Package/ath11k-firmware-ipq9574
 $(Package/ath11k-firmware-default)
   TITLE:=IPQ9574 ath11k firmware
+  URL:=https://github.com/quic/upstream-wifi-fw
+  LICENSE:=LicenseRef-QuIC
+  LICENSE_FILES:=../$(ATH11K_LEGACY_FW_SUBDIR)/ath11k-firmware/LICENSE.md
 endef
 
 define Build/Clean
 	$(call Build/Clean/Default,)
 
 	rm -rf \
-		$(BUILD_DIR)/$(ATH11K_LEGACY_FW_SUBDIR) \
-		$(BUILD_DIR)/$(ATH11K_IPQ9574_FW_SUBDIR)
+		$(BUILD_DIR)/$(ATH11K_LEGACY_FW_SUBDIR)
 endef
 
 define Build/Prepare
 	$(call Build/Prepare/Default,)
 
 	$(TAR) -C $(BUILD_DIR) -xf $(DL_DIR)/$(ATH11K_LEGACY_FW_SOURCE)
-	$(TAR) -C $(BUILD_DIR) -xf $(DL_DIR)/$(ATH11K_IPQ9574_FW_SOURCE)
 endef
 
 define Build/Compile
@@ -124,13 +103,18 @@ define Package/ath11k-firmware-ipq6018/install
 endef
 
 define Package/ath11k-firmware-ipq9574/install
-	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ9574/hw1.0
+	$(INSTALL_DIR) $(1)/lib/firmware/IPQ9574
 	$(INSTALL_DATA) \
-		$(BUILD_DIR)/$(ATH11K_LEGACY_FW_SUBDIR)/ath11k-firmware/IPQ9574/hw1.0/2.11.0.1.1/WLAN.HK.2.11.0.1.1-00039-QCAHKSWPL_SILICONZ-1/*.* \
-		$(1)/lib/firmware/ath11k/IPQ9574/hw1.0/
+		$(BUILD_DIR)/$(ATH11K_LEGACY_FW_SUBDIR)/$(ATH11K_IPQ9574_SUBDIR)/q6_fw.mdt \
+		$(BUILD_DIR)/$(ATH11K_LEGACY_FW_SUBDIR)/$(ATH11K_IPQ9574_SUBDIR)/q6_fw.b?? \
+		$(BUILD_DIR)/$(ATH11K_LEGACY_FW_SUBDIR)/$(ATH11K_IPQ9574_SUBDIR)/m3_fw.mdt \
+		$(BUILD_DIR)/$(ATH11K_LEGACY_FW_SUBDIR)/$(ATH11K_IPQ9574_SUBDIR)/m3_fw.b?? \
+		$(1)/lib/firmware/IPQ9574/
+	$(INSTALL_DIR) $(1)/usr/share/licenses/ath11k-firmware-ipq9574
 	$(INSTALL_DATA) \
-		$(BUILD_DIR)/$(ATH11K_IPQ9574_FW_SUBDIR)/IPQ9574/hw1.0/board-2.bin \
-		$(1)/lib/firmware/ath11k/IPQ9574/hw1.0/
+		$(BUILD_DIR)/$(ATH11K_LEGACY_FW_SUBDIR)/ath11k-firmware/LICENSE.md \
+		$(BUILD_DIR)/$(ATH11K_LEGACY_FW_SUBDIR)/$(ATH11K_IPQ9574_SUBDIR)/Notice.txt \
+		$(1)/usr/share/licenses/ath11k-firmware-ipq9574/
 endef
 
 $(eval $(call BuildPackage,ath11k-firmware-ipq5018-qcn6122))

@@ -8,8 +8,12 @@ touch /etc/config/ubootenv
 board=$(board_name)
 
 case "$board" in
-8devices,kiwi-dvk)
+8devices,kiwi-dvk|\
+askey,sbe1v1k)
 	ubootenv_add_mmc "0:APPSBLENV" "" "0x0" "0x40000" "0x40000"
+	;;
+linksys,ln6001)
+	ubootenv_add_mmc "u_env" "" "0x0" "0x40000" "0x40000"
 	;;
 jiorouter,ax6000-jidu6j11-6111|\
 jiorouter,ax6000-jidu6j11-6411|\
@@ -18,6 +22,8 @@ jiorouter,ax6000-jidu6j11-6811|\
 jiorouter,ax6000-jidu6j11-6911)
 	ubootenv_add_mtd "0:APPSBLENV" "0x0" "0x40000" "0x20000"
 	;;
+
+esac
 esac
 
 config_load ubootenv
